@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+.ipynb_checkpoints/
+/output
+/output0.05
+/output0.2
+/runs
+/results
+/results
+/results
