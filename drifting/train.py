@@ -42,6 +42,9 @@ class Config:
     noise_dim: int = 32
     lr: float = 0.001
     temperature: float = 0.2
+    # Weights of attraction V+ and repulsion V- (paper Table 1); only 1, 1 is anti-symmetric
+    attraction: float = 1.0
+    repulsion: float = 1.0
 
     # Validation, saved snapshots and hardware
     eval_every: int = 500
@@ -179,7 +182,7 @@ def train(c: Config, out):
         noise = torch.randn(c.batch, c.noise_dim, generator=noise_rng, device=device)
         generated = model(noise)
 
-        loss, drift = compute_loss(generated, real, c.temperature)
+        loss, drift = compute_loss(generated, real, c.temperature, c.attraction, c.repulsion)
 
         if not torch.isfinite(loss):
             raise FloatingPointError(f'Nonfinite training loss at step {step}')
