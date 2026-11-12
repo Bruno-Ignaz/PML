@@ -3,9 +3,13 @@
 import matplotlib
 matplotlib.use('Agg')  # Save figures without opening a window
 
+import json
+import math
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
+
+from .data import NAMES
 
 
 # Shared appearance for all report figures
@@ -208,3 +212,74 @@ def curves(history, path):
 
     figure.savefig(path, bbox_inches='tight')
     plt.close(figure)
+
+
+def overview(run_dir):
+    """One panel per dataset: test points vs. samples of the best checkpoint.
+
+    run_dir is a run folder created by run.sh (with data/<dataset>/ inside).
+    Saves run_dir/overview.png and returns its path.
+    """
+    run_dir = Path(run_dir)
+    datasets = [name for name in NAMES if (run_dir / 'data' / name / 'metrics.json').exists()]
+    if not datasets:
+        raise FileNotFoundError(f'No finished datasets in {run_dir / "data"}')
+
+    columns = math.ceil(math.sqrt(len(datasets)))
+    rows = math.ceil(len(datasets) / columns)
+    figure, axes = plt.subplots(
+        rows, columns, figsize=(2.7 * columns, 2.9 * rows), squeeze=False
+    )
+
+    for ax, name in zip(axes.flat, datasets):
+        folder = run_dir / 'data' / name
+        metrics = json.loads((folder / 'metrics.json').read_text())
+        samples = np.load(folder / 'samples.npz')
+        real, generated = samples['reference'], samples['best']
+
+        ax.scatter(*real.T, s=1, alpha=0.3, color=REAL_COLOR, rasterized=True)
+        ax.scatter(*generated.T, s=1, alpha=0.5, color=GENERATED_COLOR, rasterized=True)
+
+        # Square view around the real data with 15 % padding, so all panels align
+        lower, upper = real.min(axis=0), real.max(axis=0)
+        center = (lower + upper) / 2
+        half = 0.5 * 1.15 * max((upper - lower).max(), 1e-6)
+        ax.set_xlim(center[0] - half, center[0] + half)
+        ax.set_ylim(center[1] - half, center[1] + half)
+        ax.set_aspect('equal')
+        ax.axis('off')
+
+        best = metrics['best']
+        subtitle = (f"SWD {best['test_swd']:.3f} · real {metrics['baselines']['real_real']['swd']:.3f}")
+        if 'mode_coverage' in best:
+            subtitle += f"\nmode coverage {best['mode_coverage']:.2f}"
+        ax.set_title(f'{name}\n{subtitle}', fontsize=9)
+
+    for ax in list(axes.flat)[len(datasets):]:
+        ax.set_visible(False)
+
+    config = json.loads((run_dir / 'data' / datasets[0] / 'config.json').read_text())['config']
+    figure.suptitle(f"τ = {config['temperature']}, {config['steps']} steps")
+    figure.legend(
+        handles=[
+            plt.Line2D([], [], ls='', marker='o', color=REAL_COLOR, label='Test data'),
+            plt.Line2D([], [], ls='', marker='o', color=GENERATED_COLOR,
+                       label='Generated (best checkpoint)'),
+        ],
+        loc='lower center',
+        ncol=2,
+        frameon=False,
+    )
+    figure.tight_layout(rect=(0, 0.04, 1, 1))
+
+    path = run_dir / 'overview.png'
+    figure.savefig(path, bbox_inches='tight')
+    plt.close(figure)
+    return path
+
+
+if __name__ == '__main__':
+    # python -m drifting.plots outputs/RUN_NAME [outputs/OTHER_RUN ...]
+    import sys
+    for run in sys.argv[1:]:
+        print(overview(run))
