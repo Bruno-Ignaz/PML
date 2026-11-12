@@ -247,17 +247,21 @@ def train(c: Config, out):
         }
 
         # Additional mode diagnostics for Gaussian mixtures.
-        if c.dataset in ('bimodal', 'ring'):
+        if c.dataset in ('bimodal', 'ring', 'grid'):
             if c.dataset == 'bimodal':
                 centers = np.array([[-2.0, 0.0], [2.0, 0.0]])
                 sigma = 0.25
-            else:
+            elif c.dataset == 'ring':
                 angles = np.arange(8) * np.pi / 4
                 centers = 2 * np.column_stack([
                     np.cos(angles),
                     np.sin(angles),
                 ])
                 sigma = 0.12
+            else:
+                coords = np.arange(5) - 2.0
+                centers = np.array([[a, b] for a in coords for b in coords])
+                sigma = 0.05
 
             centers = (centers - splits.mean) / splits.scale
             scores.update(

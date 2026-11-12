@@ -8,7 +8,7 @@ import math
 
 NAMES = (
     'bimodal', 'ring', 'moons', 'spiral', 'checkerboard',
-    'heart', 'star', 'hearts',
+    'heart', 'star', 'hearts', 'grid',
 )
 
 """Creating toy datasets
@@ -76,6 +76,13 @@ def make_dataset(name: str, n=12000, seed=123):
         x, _ = make_dataset('heart', n, seed=int(r.integers(2**32)))
         y = r.integers(3, size=n)
         x += np.array([[-2.2, -1.3], [2.2, -1.3], [0., 2.]])[y]
+
+    elif name == 'grid':
+        # 5x5 narrow Gaussians on a square lattice with spacing 1
+        coords = np.arange(5) - 2.
+        centers = np.array([[a, b] for a in coords for b in coords])
+        y = r.integers(len(centers), size=n)
+        x = centers[y] + r.normal(0, .05, (n, 2))
 
     #Checkerboard
     else:
