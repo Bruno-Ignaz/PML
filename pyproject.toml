@@ -1,0 +1,29 @@
+[project]
+name = "drifting"
+version = "0.1.0"
+description = "PyTorch implementation of Generative Modeling via Drifting"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy>=2.0",
+    "scipy",
+    "matplotlib",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "nbformat",
+]
+
+# On Linux (Hydra cluster), take torch from the CUDA 12.6 index. Recent PyPI
+# wheels use CUDA 13, which requires NVIDIA driver >= 580; CUDA 12.6 runs on
+# driver >= 525. macOS keeps the regular PyPI wheel.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
