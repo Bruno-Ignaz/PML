@@ -24,6 +24,7 @@ from .metrics import evaluate, mode_metrics
 from .model import Model
 from .plots import evolution, curves
 
+INITS = ('origin', 'far', 'mode')
 
 @dataclass
 class Config:
@@ -46,6 +47,11 @@ class Config:
     # Weights of attraction V+ and repulsion V- (paper Table 1); only 1, 1 is anti-symmetric
     attraction: float = 1.0
     repulsion: float = 1.0
+    # Start state (paper Fig. 3): 'origin' (untrained output, a small blob at 0),
+    # 'far' (blob init_distance RMS units above the data centre), 'mode' (blob on the
+    # centre of mixture component 0)
+    init: str = 'origin'
+    init_distance: float = 3.0
 
     # Validation, saved snapshots and hardware
     eval_every: int = 500
@@ -67,6 +73,8 @@ def train(c: Config, out):
         raise ValueError('Temperature must be finite and positive')
     if not np.isfinite(c.lr) or c.lr <= 0:
         raise ValueError('Learning rate must be finite and positive')
+    if c.init not in INITS:
+        raise ValueError(f'Choose init from {INITS}')
 
     device = torch.device(c.device)
     if device.type == 'cuda' and not torch.cuda.is_available():
@@ -117,6 +125,20 @@ def train(c: Config, out):
         hidden=c.hidden,
         depth=c.depth,
     ).to(device)
+
+    # The untrained generator outputs a small blob near the origin. Shifting the
+    # last layer's bias moves that blob to the requested start without changing it.
+    if c.init != 'origin':
+        train_points = splits.train.x
+        if c.init == 'mode':
+            start = train_points[splits.train.y == 0].mean(axis=0)
+        else:
+            centre = train_points.mean(axis=0)
+            spread = np.sqrt(np.mean((train_points - centre) ** 2))
+            start = centre + np.array([0.0, c.init_distance * spread])
+        with torch.no_grad():
+            model.net[-1].bias += torch.as_tensor(start, dtype=torch.float32, device=device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=c.lr)
 
     metadata = {
@@ -364,6 +386,7 @@ def main():
     defaults = asdict(Config())
     choices = {
         'dataset': NAMES,
+        'init': INITS,
     }
     for name, default in defaults.items():
         argument = '--' + name.replace('_', '-')
