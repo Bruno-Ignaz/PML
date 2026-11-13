@@ -97,7 +97,7 @@ def train(c: Config, out):
     train_loader, val_loader, test_loader = make_loaders(
         reference_points,
         reference_labels,
-        seed=shuffle_seed,
+        seed=c.split_seed,
         normalize=c.normalize
     )
 
@@ -187,7 +187,7 @@ def train(c: Config, out):
         batch = list(islice(train_loader, c.batch))
 
         # Restart after empty batch
-        if len(batch) < 2:
+        if len(batch) < c.batch:
             epoch += 1
             train_loader = splits.train.stream(
                 shuffle=True,
