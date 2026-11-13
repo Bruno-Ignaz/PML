@@ -20,12 +20,15 @@ import torch
 
 from .data import NAMES, make_dataset, split_dataset, make_loaders
 from .field import compute_loss
-from .metrics import evaluate, mode_metrics
+from .metrics import evaluate, mode_metrics, sliced_wasserstein
 from .model import Model
 from .plots import evolution, curves
 
 INITS = ('origin', 'far', 'mode')
 TRAIN_DATA = ('split', 'fresh')
+# Early steps where the distribution moves fastest; PLOT_STEPS also get PNG plots
+EARLY_STEPS = (0, 10, 25, 50, 75, 100, 150, 200, 300, 400, 500, 750)
+PLOT_STEPS = (0, 50, 100, 200, 500, 1000, 2000)
 
 @dataclass
 class Config:
@@ -59,7 +62,9 @@ class Config:
     train_data: str = 'split'
 
     # Validation, saved snapshots and hardware
-    eval_every: int = 500
+    eval_every: int = 500  # full validation (SWD and MMD^2)
+    snapshot_every: int = 250  # samples and validation SWD, plus dense early steps
+    checkpoint_every: int = 500  # model weights in checkpoints/; 0 = only best and last
     eval_n: int = 1800
     device: str = 'cpu'
     threads: int = 1
@@ -68,7 +73,7 @@ def train(c: Config, out):
     """Train, select by validation SWD, then evaluate the selected model on test."""
     if c.dataset not in NAMES:
         raise ValueError(f'Choose a dataset from {NAMES}')
-    if min(c.steps, c.eval_every, c.threads, c.hidden, c.depth, c.noise_dim) < 1:
+    if min(c.steps, c.eval_every, c.snapshot_every, c.threads, c.hidden, c.depth, c.noise_dim) < 1 or c.checkpoint_every < 0:
         raise ValueError('Training counts and model dimensions must be positive')
     if c.batch < 20 or c.n < 20:
         raise ValueError('make_dataset requires n and batch to be at least 20')
@@ -171,12 +176,14 @@ def train(c: Config, out):
 
     history = []
     snapshots = {}
-    # Save the same training stages shown in the paper
-    snapshot_steps = {0, 50, 100, 200, 500, 1000, 2000}
+    # Generated validation samples: dense early, then every snapshot_every steps
+    snapshot_steps = set(EARLY_STEPS) | set(range(0, c.steps + 1, c.snapshot_every))
     snapshot_steps = {step for step in snapshot_steps if step <= c.steps}
     snapshot_steps.add(c.steps)  # Always include the final step
     best_validation_swd = float('inf')
     best_step = 0
+    if c.checkpoint_every:
+        (output_dir / 'checkpoints').mkdir()
 
     def save_checkpoint(filename, step):
         torch.save(
@@ -190,30 +197,39 @@ def train(c: Config, out):
             output_dir / filename,
         )
 
-    def validate(step):
-        """Evaluate fixed validation noise; never inspect the test set here"""
+    def validate(step, full):
+        """Evaluate fixed validation noise; never inspect the test set here.
+
+        SWD at every call (cheap); MMD^2 only for full evaluations and new best
+        checkpoints, so every checkpoint that can be selected has both scores.
+        """
         nonlocal best_validation_swd, best_step
         model.eval()
         with torch.no_grad():
             generated_points = model(fixed_noise).cpu().numpy()
 
-        scores = evaluate(generated_points, validation_points)
+        swd = sliced_wasserstein(generated_points, validation_points)
+        improved = swd < best_validation_swd
+        scores = evaluate(generated_points, validation_points) if full or improved else {'swd': swd}
         if not all(np.isfinite(value) for value in scores.values()):
             raise FloatingPointError(f'Nonfinite validation metric at step {step}')
 
         if step in snapshot_steps:
             snapshots[step] = generated_points.copy()
 
-        if scores['swd'] < best_validation_swd:
-            best_validation_swd = scores['swd']
+        if improved:
+            best_validation_swd = swd
             best_step = step
             save_checkpoint('best.pt', step)
 
         model.train()
-        return {'step': step, 'val_swd': scores['swd'], 'val_mmd2': scores['mmd2']}
+        row = {'step': step, 'val_swd': swd}
+        if 'mmd2' in scores:
+            row['val_mmd2'] = scores['mmd2']
+        return row
 
     #Validate at step 0
-    history.append(validate(0))
+    history.append(validate(0, full=True))
 
     for step in range(1, c.steps + 1):
         if c.train_data == 'fresh':
@@ -249,13 +265,16 @@ def train(c: Config, out):
             'loss': loss.detach().item(),
             'drift_norm_squared': drift.square().sum(dim=1).mean().item(),
         }
-        if step % c.eval_every == 0 or step in snapshot_steps:
-            row.update(validate(step))
+        full = step % c.eval_every == 0 or step == c.steps
+        if full or step in snapshot_steps:
+            row.update(validate(step, full))
             print(
                 f'Step {step:5d}/{c.steps} | loss {row["loss"]:.6f} | '
                 f'validation SWD {row["val_swd"]:.4f}',
                 flush=True,
             )
+        if c.checkpoint_every and step % c.checkpoint_every == 0:
+            save_checkpoint(f'checkpoints/step_{step:05d}.pt', step)
         history.append(row)
 
     save_checkpoint('last.pt', c.steps)
@@ -375,10 +394,10 @@ def train(c: Config, out):
         test_noise=test_noise.cpu().numpy(),
     )
 
-    # Save sample evolution and training curves
+    # Save sample evolution (paper steps and the final step only) and training curves
     evolution(
         validation_points,
-        snapshots,
+        {step: points for step, points in snapshots.items() if step in PLOT_STEPS or step == c.steps},
         output_dir / 'evolution.png',
     )
     curves(history, output_dir / 'curves.png')
