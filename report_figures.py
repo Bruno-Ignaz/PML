@@ -292,6 +292,38 @@ def fig_loss():
     save(figure, 'loss_vs_swd.pdf')
 
 
+def fig_training_length():
+    """Batch size and training length at tau 0.1 (8000 steps, seed 42), from the dense snapshots."""
+    from drifting.metrics import mode_metrics
+    batches = [b for b in BATCHES if metrics(f't0.1-norm-b{b}-steps8000-5000val_samples', 'grid')]
+    if not batches or not all(metrics(f't0.1-norm-b{b}-steps8000-5000val_samples', n) for b in batches for n in NAMES):
+        print('training_length.pdf skipped: 8000-step runs missing')
+        return
+    coords = np.arange(5) - 2.0
+    centres = np.array([[a, b] for a in coords for b in coords])
+    figure, (left, right) = plt.subplots(1, 2, figsize=(TEXT_WIDTH, 1.9), gridspec_kw=dict(wspace=0.35))
+    for b, color in zip(batches, TAU_COLORS):
+        run = f't0.1-norm-b{b}-steps8000-5000val_samples'
+        curves = []
+        for name in NAMES:
+            _, val = history(run, name)
+            curves.append(val[:, 1] / metrics(run, name)['baselines']['real_real']['swd'])
+        left.plot(val[:, 0], np.median(curves, axis=0), color=color, lw=1.1, label=f'$N={b}$')
+        s = samples(run, 'grid')
+        config = json.loads((folder(run, 'grid') / 'config.json').read_text())['normalization']
+        mean, scale = np.array(config['mean']), config['scale']
+        steps = sorted(int(k[5:]) for k in s.files if k.startswith('step_'))
+        covered = [round(25 * mode_metrics(s[f'step_{t}'], (centres - mean) / scale, 0.05 / scale)['mode_coverage']) for t in steps]
+        right.plot(steps, covered, color=color, lw=1.1, marker='o', ms=2)
+    left.set(yscale='log', xlabel='training step', ylabel='validation SWD / reference\n(median over 9 datasets)')
+    right.set(xlabel='training step', ylabel='grid modes covered (of 25)', ylim=(-1, 26))
+    left.legend(frameon=False, handlelength=1.2)
+    for ax in (left, right):
+        ax.grid(alpha=0.25, lw=0.4)
+        ax.set_xlim(0, 8000)
+    save(figure, 'training_length.pdf')
+
+
 # ---------- tables ----------
 
 def fmt(value):
@@ -378,6 +410,7 @@ if __name__ == '__main__':
     fig_failures()
     fig_ablation()
     fig_loss()
+    fig_training_length()
     table_tau()
     table_ablation()
     table_init()
