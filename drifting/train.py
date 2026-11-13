@@ -13,11 +13,12 @@ import platform
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from itertools import islice
 
 import numpy as np
 import torch
 
-from .data import NAMES, make_dataset, split_dataset
+from .data import NAMES, make_dataset, split_dataset, make_loaders
 from .field import compute_loss
 from .metrics import evaluate, mode_metrics
 from .model import Model
@@ -48,7 +49,7 @@ class Config:
 
     # Validation, saved snapshots and hardware
     eval_every: int = 500
-    eval_n: int = 1000
+    eval_n: int = 1800
     device: str = 'cpu'
     threads: int = 1
 
@@ -89,12 +90,24 @@ def train(c: Config, out):
     evaluation_count = min(
         c.eval_n, len(splits.train.x), len(splits.val.x), len(splits.test.x)
     )
-    validation_points = splits.val.x[:evaluation_count]
+    epoch = 0
+    shuffle_seed = c.seed
 
-    # Independent streams keep evaluation from changing the training trajectory.
+    #Data loaders
+    train_loader, val_loader, test_loader = make_loaders(
+        reference_points,
+        reference_labels,
+        seed=shuffle_seed,
+        normalize=c.normalize
+    )
+
+    validation_points = np.stack([
+        point for point, _ in islice(val_loader, evaluation_count)
+    ])
+
+    # Independent streams keep evaluation from changing the training trajectory
     noise_rng = torch.Generator(device=device).manual_seed(c.seed + 1000)
-    data_rng = np.random.default_rng(np.random.SeedSequence([c.seed, c.data_seed, 4321]))
-    validation_rng = torch.Generator(device=device).manual_seed(91234)
+    validation_rng = torch.Generator(device=device).manual_seed(1234)
     fixed_noise = torch.randn(
         evaluation_count, c.noise_dim, generator=validation_rng, device=device
     )
@@ -146,7 +159,7 @@ def train(c: Config, out):
         )
 
     def validate(step):
-        """Evaluate fixed validation noise; never inspect the test set here."""
+        """Evaluate fixed validation noise; never inspect the test set here"""
         nonlocal best_validation_swd, best_step
         model.eval()
         with torch.no_grad():
@@ -167,19 +180,28 @@ def train(c: Config, out):
         model.train()
         return {'step': step, 'val_swd': scores['swd'], 'val_mmd2': scores['mmd2']}
 
+    #Validate at step 0
     history.append(validate(0))
 
     for step in range(1, c.steps + 1):
-        # Fresh real batch, with a reproducible new seed on each update.
-        batch_seed = int(data_rng.integers(0, 2**63))
-        real_points, _ = make_dataset(c.dataset, n=c.batch, seed=batch_seed)
+        batch = list(islice(train_loader, c.batch))
 
-        # Identity transformation when normalize=False; otherwise use the SAME
-        # training-reference mean/scale as validation and test, never batch statistics.
-        real_points = (real_points - splits.mean) / splits.scale
-        real = torch.as_tensor(real_points, dtype=torch.float32, device=device)
+        # Restart after empty batch
+        if len(batch) < 2:
+            epoch += 1
+            train_loader = splits.train.stream(
+                shuffle=True,
+                seed=shuffle_seed + epoch,
+            )
+            batch = list(islice(train_loader, c.batch))
 
-        noise = torch.randn(c.batch, c.noise_dim, generator=noise_rng, device=device)
+        real = torch.as_tensor(
+            np.stack([point for point, _ in batch]),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        noise = torch.randn(len(real), c.noise_dim, generator=noise_rng, device=device)
         generated = model(noise)
 
         loss, drift = compute_loss(generated, real, c.temperature, c.attraction, c.repulsion)
@@ -189,7 +211,7 @@ def train(c: Config, out):
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        optimizer.step()  # No gradient clipping, matching the demo.
+        optimizer.step()
 
         row = {
             'step': step,
@@ -207,8 +229,10 @@ def train(c: Config, out):
 
     save_checkpoint('last.pt', c.steps)
 
-    # Use identical test points and latent noise for both checkpoints.
-    test_points = splits.test.x[:evaluation_count]
+    # Use identical test points and noise
+    test_points = np.stack([
+        point for point, _ in islice(test_loader, evaluation_count)
+    ])
     test_rng = torch.Generator(device=device).manual_seed(71234)
     test_noise = torch.randn(
         evaluation_count,
@@ -282,7 +306,7 @@ def train(c: Config, out):
 
     best_samples, last_samples = checkpoint_samples
 
-    # Baselines are shared by both checkpoints.
+    # Baselines are shared by both checkpoints
     baseline_rng = np.random.default_rng(71234)
     gaussian_points = baseline_rng.normal(size=(evaluation_count, 2))
     gaussian_points = (gaussian_points - splits.mean) / splits.scale

@@ -107,7 +107,7 @@ class Split:
     y: np.ndarray
     indices: np.ndarray
     def stream(self, transform: Callable | None = None, *, shuffle=False, seed=0):
-        """One finite epoch; transformations run only at next(), never eagerly."""
+        """One finite epoch, transformations run only at next()"""
         order = np.random.default_rng(seed).permutation(len(self.x)) if shuffle else range(len(self.x))
         for i in order:
             x = self.x[i].copy()
