@@ -25,6 +25,7 @@ from .model import Model
 from .plots import evolution, curves
 
 INITS = ('origin', 'far', 'mode')
+TRAIN_DATA = ('split', 'fresh')
 
 @dataclass
 class Config:
@@ -52,6 +53,10 @@ class Config:
     # centre of mixture component 0)
     init: str = 'origin'
     init_distance: float = 3.0
+    # Training points per step: 'split' = full batches from shuffled epochs over the
+    # training split; 'fresh' = new samples from the true sampler every step, as in
+    # the official demo (used for the first experiment series)
+    train_data: str = 'split'
 
     # Validation, saved snapshots and hardware
     eval_every: int = 500
@@ -75,6 +80,8 @@ def train(c: Config, out):
         raise ValueError('Learning rate must be finite and positive')
     if c.init not in INITS:
         raise ValueError(f'Choose init from {INITS}')
+    if c.train_data not in TRAIN_DATA:
+        raise ValueError(f'Choose train_data from {TRAIN_DATA}')
 
     device = torch.device(c.device)
     if device.type == 'cuda' and not torch.cuda.is_available():
@@ -98,10 +105,12 @@ def train(c: Config, out):
     evaluation_count = min(
         c.eval_n, len(splits.train.x), len(splits.val.x), len(splits.test.x)
     )
+    if c.train_data == 'split' and c.batch > len(splits.train.x):
+        raise ValueError('batch is larger than the training split; increase n')
     epoch = 0
-    shuffle_seed = c.seed
 
-    #Data loaders
+    # Data loaders over the SAME split as `splits` (split_seed), so training,
+    # normalisation, validation and test never mix two different splits
     train_loader, val_loader, test_loader = make_loaders(
         reference_points,
         reference_labels,
@@ -115,7 +124,8 @@ def train(c: Config, out):
 
     # Independent streams keep evaluation from changing the training trajectory
     noise_rng = torch.Generator(device=device).manual_seed(c.seed + 1000)
-    validation_rng = torch.Generator(device=device).manual_seed(1234)
+    data_rng = np.random.default_rng(np.random.SeedSequence([c.seed, c.data_seed, 4321]))
+    validation_rng = torch.Generator(device=device).manual_seed(91234)
     fixed_noise = torch.randn(
         evaluation_count, c.noise_dim, generator=validation_rng, device=device
     )
@@ -206,22 +216,21 @@ def train(c: Config, out):
     history.append(validate(0))
 
     for step in range(1, c.steps + 1):
-        batch = list(islice(train_loader, c.batch))
-
-        # Restart after empty batch
-        if len(batch) < c.batch:
-            epoch += 1
-            train_loader = splits.train.stream(
-                shuffle=True,
-                seed=shuffle_seed + epoch,
-            )
+        if c.train_data == 'fresh':
+            # New samples from the true sampler, normalised with the training statistics
+            batch_seed = int(data_rng.integers(0, 2**63))
+            real_points, _ = make_dataset(c.dataset, n=c.batch, seed=batch_seed)
+            real_points = (real_points - splits.mean) / splits.scale
+        else:
             batch = list(islice(train_loader, c.batch))
+            # Drop the incomplete rest of an epoch so every step uses c.batch points
+            if len(batch) < c.batch:
+                epoch += 1
+                train_loader = splits.train.stream(shuffle=True, seed=c.seed + epoch)
+                batch = list(islice(train_loader, c.batch))
+            real_points = np.stack([point for point, _ in batch])
 
-        real = torch.as_tensor(
-            np.stack([point for point, _ in batch]),
-            dtype=torch.float32,
-            device=device,
-        )
+        real = torch.as_tensor(real_points, dtype=torch.float32, device=device)
 
         noise = torch.randn(len(real), c.noise_dim, generator=noise_rng, device=device)
         generated = model(noise)
@@ -387,6 +396,7 @@ def main():
     choices = {
         'dataset': NAMES,
         'init': INITS,
+        'train_data': TRAIN_DATA,
     }
     for name, default in defaults.items():
         argument = '--' + name.replace('_', '-')

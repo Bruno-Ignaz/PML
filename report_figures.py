@@ -144,7 +144,7 @@ def fig_datasets():
     """The nine toy distributions in original coordinates, drawn with plot_points."""
     figure, axes = plt.subplots(3, 3, figsize=(TEXT_WIDTH, TEXT_WIDTH + 0.2))
     for i, (ax, name) in enumerate(zip(axes.flat, NAMES)):
-        points = samples('t0.1', name)['reference']  # raw test points
+        points = samples('t0.1', name)['reference'][:1000]  # raw test points
         plot_points(points, ax=ax, title=name)
         # 1000 points per panel: vector graphics stay sharp at any zoom
         ax.collections[0].set_sizes([2.5])
@@ -349,6 +349,10 @@ def table_init():
 
 
 def table_batch():
+    runs = [f't{t}-norm-b{b}-steps8000-5000val_samples' for t in TAUS for b in BATCHES]
+    if not all(metrics(r, n) for r in runs for n in NAMES):
+        print('table_batch.tex skipped: tau x batch runs incomplete')
+        return
     lines = [r'\begin{tabular}{l' + 'c' * len(BATCHES) + '}', r'\hline',
              ' & ' + ' & '.join(f'$B={b}$' for b in BATCHES) + r' \\', r'\hline']
     for tau in TAUS:
