@@ -1,113 +1,219 @@
-# Drifting Models — PML Milestone 1
+# Project Machine Learning: Generative Modeling via Drifting
 
 A runnable PyTorch implementation of "Generative Modeling via Drifting".
 
-## Install (Windows PowerShell, Linux, macOS)
+## Setup Environment
 
 Use Python 3.10 or later
 
 ```sh
-python -m venv .venv
+pip install -r requirements.txt
 ```
 
-Activate with `.venv\Scripts\Activate.ps1` in PowerShell, or
-`source .venv/bin/activate` in bash. For a CPU installation:
+For CUDA, install a PyTorch build appropriate to your GPU instead of the pytorch version in requirements.txt
+
+## Run the experiments
+
+Run commands from the project root.
+
+To train on all toy datasets:
 
 ```sh
-python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -e ".[dev]"
-python -m pytest -q
+python run_all.py
 ```
 
-For CUDA, install a PyTorch build appropriate to your GPU before the editable
-install; choose `--device cuda`. Included experiments were run on CPU. Exact
-cross-device bitwise agreement is not promised. `environment-tested.txt` records
-the packages used for the delivered runs; project dependencies use lower bounds
-so other supported platforms can resolve appropriate wheels.
+This runs one experiment per dataset.
 
-## Train, evaluate, generate
+In `run_all.py`, you can change the output directory and device:
+
+```python
+results_folder = Path('runs')
+seed = 42
+device = 'cpu'  # Use 'cuda' for an available NVIDIA GPU.
+```
+
+Training settings are defined in `Config` in `drifting/train.py`. You can override them when constructing the configuration:
+
+```python
+config = Config(
+    dataset=dataset,
+    seed=seed,
+    device=device,
+    steps=2000,
+    temperature=0.05,
+)
+```
+
+To train on just one dataset:
 
 ```sh
-# A small initial sanity run (not enough for scientific conclusions)
-python -m drifting.train --steps 50 --eval-every 25 --out runs/smoke
-
-# All five datasets, three training seeds, and six controlled ablations per seed
-python -m drifting.suite --out runs/full --steps 2000 --seeds 0 1 2 --ablations
-
-# Recreate the delivered experiment budget
-python -m drifting.suite --out runs/delivered --steps 1000 --seeds 0 1 2 --ablations
-
-# Sample in ORIGINAL dataset units with the validation-selected checkpoint
-python -m drifting.sample results/bimodal_seed0/best.pt --n 5000 --out generated.npy
-
-# Rebuild aggregate CSV, Markdown table and overview figure
-python -m drifting.summarize results
-python -m drifting.analyze results
+python -m drifting.train --dataset spiral --out <output path>
 ```
 
-Each individual training output directory must be new (prevents accidental
-replacement). The suite skips completed runs only when their configurations
-match, and rejects incomplete directories; move aside an interrupted run before
-rerunning it. There is no mid-run optimizer resume. Longer runs are a new
-experiment and should use a fresh output directory.
+For a short check that the pipeline works:
 
-## What is included
+```sh
+python -m drifting.train --dataset spiral --steps 50 --eval-every 25 --out runs/smoke
+```
 
-| Requirement | Implementation / evidence |
+Existing experiment folders are not overwritten. Choose a new output directory when rerunning an experiment.
+
+### Saved results
+
+Each experiment produces:
+
+| File or folder | Contents |
 |---|---|
-| Several 2D datasets | `data.py`: bimodal, 8-mode ring, moons, spiral, checkerboard |
-| Three lazy Python generators with optional transforms | `make_loaders`; finite epochs, individual `(xi, yi)` pairs |
-| Reproducible train/val/test split | 70/15/15; saved indices; training-only isotropic scaling |
-| Extensible plots and evolution | `plots.py`; shared-axis snapshots, overlays, density mode |
-| Drifting field and stop-gradient loss | `field.py`; paper Algorithm 2 and Eq. 10 variants |
-| `Model(torch.nn.Module)` | `model.py`; configurable SiLU MLP, Gaussian noise input |
-| Training all datasets, logging norm and saving samples | `train.py`; CSV, NPZ, checkpoints and figures |
-| Paper-inspired toy experiments | Spiral/checkerboard; middle/far/concentrated bimodal starts |
-| Evaluation and limitations | SWD, unbiased MMD², real–real floor, Gaussian baseline, mode metrics |
-| Controlled comparisons | Small/large temperature, no repulsion, row-only field |
-| Scientific correctness tests | Explicit triple sum, anti-symmetry, stop-gradient, geometry, data splits |
-| Report preparation | `docs/METHOD.md`, `docs/REPORT_GUIDE.md`, measured `results/RESULTS.md` |
-| AI disclosure | `docs/AI_DISCLOSURE.md` — adapt to your actual workflow |
+| `config.json` | Configuration, seeds, software versions, and preprocessing information |
+| `best.pt` | Checkpoint with the lowest validation SWD |
+| `last.pt` | Checkpoint after the final training update |
+| `metrics.json` | Best and final checkpoint metrics, reference baselines, and runtime |
+| `history.csv` | Training loss, mean squared drift, and validation metrics |
+| `curves.png` | Loss and validation curves |
+| `evolution/` | Separate sample plots at the saved training steps |
+| `samples.npz` | Generated samples, reference points, and evaluation noise |
+| `splits.npz` | Indices defining the fixed dataset splits |
+
+## Using the individual components
+
+### Create a toy dataset
+
+Available datasets are `bimodal`, `ring`, `moons`, `spiral`, `checkerboard`, `heart`, `star`, and `hearts`.
+
+```python
+from drifting.data import make_dataset
+
+points, labels = make_dataset('heart', n=12000, seed=123)
+
+print(points.shape)  # (12000, 2): x and y coordinates
+print(labels.shape)  # (12000,): component labels
+```
+
+
+### Data loading
+
+`make_loaders()` returns three Python generators yielding individual `(point, label)` pairs.
+
+```python
+from drifting.data import make_dataset, make_loaders
+
+points, labels = make_dataset('spiral', n=12000, seed=123)
+
+train_loader, val_loader, test_loader = make_loaders(
+    points,
+    labels,
+    ratio=(0.7, 0.15, 0.15),
+    seed=321,
+)
+
+point, label = next(train_loader)
+```
+
+Each generator makes one finite pass through its split. Call `make_loaders()` again to create new generators.
+
+An optional transformation is applied when each point is requested:
+
+```python
+import torch
+
+train_loader, val_loader, test_loader = make_loaders(
+    points,
+    labels,
+    transform=lambda point: torch.as_tensor(point, dtype=torch.float32),
+)
+```
+
+To access the split arrays and optionally normalize:
+
+```python
+from drifting.data import split_dataset
+
+splits = split_dataset(points, labels, normalize=False)
+
+train_points = splits.train.x
+validation_points = splits.val.x
+test_points = splits.test.x
+```
+
+With `normalize=True`, all splits use the training split's mean and one shared scale for both coordinates, preserving the shapes
+
+### Visualize points
+
+```python
+import matplotlib.pyplot as plt
+from drifting.plots import plot_points
+
+ax = plot_points(points, title='Heart dataset')
+ax.legend()
+
+ax.figure.savefig('heart.png', bbox_inches='tight')
+plt.close(ax.figure)
+```
+
+Overlay generated samples by passing a second array:
+
+```python
+ax = plot_points(
+    points,
+    generated_points,
+    title='Real and generated samples',
+)
+
+ax.legend()
+ax.figure.savefig('comparison.png', bbox_inches='tight')
+plt.close(ax.figure)
+```
+
+Here, `generated_points` is an `(N, 2)` array produced by your model.
+
+Use `kind='density'` to display the real points as a density plot:
+
+```python
+ax = plot_points(points, kind='density', title='Sample density')
+ax.figure.savefig('density.png', bbox_inches='tight')
+plt.close(ax.figure)
+```
+
+
+### Compute the drifting field and loss
+
+```python
+import torch
+
+from drifting.data import make_dataset
+from drifting.field import compute_field, compute_loss
+from drifting.model import Model
+
+model = Model(noise_dim=32, hidden=256, depth=3)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+real_points, _ = make_dataset('spiral', n=256, seed=123)
+real = torch.from_numpy(real_points)
+
+noise = torch.randn(256, 32)
+generated = model(noise)
+
+# Inspect the field independently.
+drift = compute_field(generated, real, temperature=0.05)
+print(drift.shape)  # (256, 2)
+
+# One optimization step. compute_loss() also returns the drift.
+loss, drift = compute_loss(generated, real, temperature=0.05)
+
+optimizer.zero_grad(set_to_none=True)
+loss.backward()
+optimizer.step()
+```
+
 
 Paths in the table are relative to `drifting/` unless explicitly stated.
-
-## Read results correctly
-
-`results/RESULTS.md` is generated from actual runs. Each run contains:
-
-- `config.json`: hyperparameters, seeds, package versions and preprocessing.
-- `splits.npz`: original row indices for auditing split disjointness.
-- `history.csv`: loss and gradient norm each step; validation metrics periodically.
-- `best.pt` / `last.pt`: validation-selected and final checkpoints.
-- `samples.npz`: fixed-noise snapshots, selected-checkpoint samples with fresh noise,
-  test reference, validation reference, and fixed latent inputs.
-- `evolution.png` / `curves.png`: report figures.
-- `metrics.json`: one final test evaluation plus reference baselines.
-
-All metrics/plots use train-standardized units. The sampling CLI reverses that
-normalization. Class/component labels are metadata only, never generator inputs.
-There is no encoder, classifier-free guidance, diffusion sampler, discriminator,
-or image generation in this milestone.
 
 ## Sources and scope
 
 Deng et al., *Generative Modeling via Drifting*:
-https://arxiv.org/abs/2602.04770 (implementation checked against v2,
-https://arxiv.org/html/2602.04770v2, Algorithms 1–2 and Section 5.1).
+https://arxiv.org/abs/2602.04770
 Official demonstration:
 https://colab.research.google.com/github/lambertae/lambertae.github.io/blob/main/projects/drifting/notebooks/drifting_model_demo.ipynb
 
-This is an independently written educational implementation. It reproduces the
-core field mathematically and studies the same qualitative toy questions;
-it does **not** claim an exact numerical replication of the authors' experiments.
-See `docs/METHOD.md` for all important deviations.
-
-## Submission steps you must complete
-
-1. Understand the implementation and write the coherent scientific report; omit
-   code listings from it. Include your AI-use disclosure.
-2. Create your GitHub repository, upload the source, create a "Milestone 1" GitHub
-   milestone, and invite your actual supervisor. These account actions have not
-   been performed by this package.
-3. Submit the report through ISIS following your course's format/deadline.
+This is an independently written educational implementation.
 
