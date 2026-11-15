@@ -12,7 +12,7 @@ from drifting.train import Config, train
 def main():
     results_folder = Path('output0.05')
     seed = 42
-    device = 'cpu'  # Change to 'cuda' to use GPU
+    device = 'cuda'  # Change to 'cuda' to use GPU
 
     # Check before starting, so existing results are not overwritten.
     for dataset in NAMES:

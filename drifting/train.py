@@ -13,16 +13,22 @@ import platform
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from itertools import islice
 
 import numpy as np
 import torch
 
-from .data import NAMES, make_dataset, split_dataset
+from .data import NAMES, make_dataset, split_dataset, make_loaders
 from .field import compute_loss
-from .metrics import evaluate, mode_metrics
+from .metrics import evaluate, mode_metrics, sliced_wasserstein
 from .model import Model
 from .plots import evolution, curves
 
+INITS = ('origin', 'far', 'mode')
+TRAIN_DATA = ('split', 'fresh')
+# Early steps where the distribution moves fastest; PLOT_STEPS also get PNG plots
+EARLY_STEPS = (0, 10, 25, 50, 75, 100, 150, 200, 300, 400, 500, 750)
+PLOT_STEPS = (0, 50, 100, 200, 500, 1000, 2000)
 
 @dataclass
 class Config:
@@ -42,10 +48,24 @@ class Config:
     noise_dim: int = 32
     lr: float = 0.001
     temperature: float = 0.2
+    # Weights of attraction V+ and repulsion V- (paper Table 1); only 1, 1 is anti-symmetric
+    attraction: float = 1.0
+    repulsion: float = 1.0
+    # Start state (paper Fig. 3): 'origin' (untrained output, a small blob at 0),
+    # 'far' (blob init_distance RMS units above the data centre), 'mode' (blob on the
+    # centre of mixture component 0)
+    init: str = 'origin'
+    init_distance: float = 3.0
+    # Training points per step: 'split' = full batches from shuffled epochs over the
+    # training split; 'fresh' = new samples from the true sampler every step, as in
+    # the official demo (used for the first experiment series)
+    train_data: str = 'split'
 
     # Validation, saved snapshots and hardware
-    eval_every: int = 500
-    eval_n: int = 1000
+    eval_every: int = 500  # full validation (SWD and MMD^2)
+    snapshot_every: int = 250  # samples and validation SWD, plus dense early steps
+    checkpoint_every: int = 500  # model weights in checkpoints/; 0 = only best and last
+    eval_n: int = 1800
     device: str = 'cpu'
     threads: int = 1
 
@@ -53,7 +73,7 @@ def train(c: Config, out):
     """Train, select by validation SWD, then evaluate the selected model on test."""
     if c.dataset not in NAMES:
         raise ValueError(f'Choose a dataset from {NAMES}')
-    if min(c.steps, c.eval_every, c.threads, c.hidden, c.depth, c.noise_dim) < 1:
+    if min(c.steps, c.eval_every, c.snapshot_every, c.threads, c.hidden, c.depth, c.noise_dim) < 1 or c.checkpoint_every < 0:
         raise ValueError('Training counts and model dimensions must be positive')
     if c.batch < 20 or c.n < 20:
         raise ValueError('make_dataset requires n and batch to be at least 20')
@@ -63,6 +83,10 @@ def train(c: Config, out):
         raise ValueError('Temperature must be finite and positive')
     if not np.isfinite(c.lr) or c.lr <= 0:
         raise ValueError('Learning rate must be finite and positive')
+    if c.init not in INITS:
+        raise ValueError(f'Choose init from {INITS}')
+    if c.train_data not in TRAIN_DATA:
+        raise ValueError(f'Choose train_data from {TRAIN_DATA}')
 
     device = torch.device(c.device)
     if device.type == 'cuda' and not torch.cuda.is_available():
@@ -86,9 +110,24 @@ def train(c: Config, out):
     evaluation_count = min(
         c.eval_n, len(splits.train.x), len(splits.val.x), len(splits.test.x)
     )
-    validation_points = splits.val.x[:evaluation_count]
+    if c.train_data == 'split' and c.batch > len(splits.train.x):
+        raise ValueError('batch is larger than the training split; increase n')
+    epoch = 0
 
-    # Independent streams keep evaluation from changing the training trajectory.
+    # Data loaders over the SAME split as `splits` (split_seed), so training,
+    # normalisation, validation and test never mix two different splits
+    train_loader, val_loader, test_loader = make_loaders(
+        reference_points,
+        reference_labels,
+        seed=c.split_seed,
+        normalize=c.normalize
+    )
+
+    validation_points = np.stack([
+        point for point, _ in islice(val_loader, evaluation_count)
+    ])
+
+    # Independent streams keep evaluation from changing the training trajectory
     noise_rng = torch.Generator(device=device).manual_seed(c.seed + 1000)
     data_rng = np.random.default_rng(np.random.SeedSequence([c.seed, c.data_seed, 4321]))
     validation_rng = torch.Generator(device=device).manual_seed(91234)
@@ -101,6 +140,20 @@ def train(c: Config, out):
         hidden=c.hidden,
         depth=c.depth,
     ).to(device)
+
+    # The untrained generator outputs a small blob near the origin. Shifting the
+    # last layer's bias moves that blob to the requested start without changing it.
+    if c.init != 'origin':
+        train_points = splits.train.x
+        if c.init == 'mode':
+            start = train_points[splits.train.y == 0].mean(axis=0)
+        else:
+            centre = train_points.mean(axis=0)
+            spread = np.sqrt(np.mean((train_points - centre) ** 2))
+            start = centre + np.array([0.0, c.init_distance * spread])
+        with torch.no_grad():
+            model.net[-1].bias += torch.as_tensor(start, dtype=torch.float32, device=device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=c.lr)
 
     metadata = {
@@ -123,12 +176,14 @@ def train(c: Config, out):
 
     history = []
     snapshots = {}
-    # Save the same training stages shown in the paper
-    snapshot_steps = {0, 50, 100, 200, 500, 1000, 2000}
+    # Generated validation samples: dense early, then every snapshot_every steps
+    snapshot_steps = set(EARLY_STEPS) | set(range(0, c.steps + 1, c.snapshot_every))
     snapshot_steps = {step for step in snapshot_steps if step <= c.steps}
     snapshot_steps.add(c.steps)  # Always include the final step
     best_validation_swd = float('inf')
     best_step = 0
+    if c.checkpoint_every:
+        (output_dir / 'checkpoints').mkdir()
 
     def save_checkpoint(filename, step):
         torch.save(
@@ -142,70 +197,92 @@ def train(c: Config, out):
             output_dir / filename,
         )
 
-    def validate(step):
-        """Evaluate fixed validation noise; never inspect the test set here."""
+    def validate(step, full):
+        """Evaluate fixed validation noise; never inspect the test set here.
+
+        SWD at every call (cheap); MMD^2 only for full evaluations and new best
+        checkpoints, so every checkpoint that can be selected has both scores.
+        """
         nonlocal best_validation_swd, best_step
         model.eval()
         with torch.no_grad():
             generated_points = model(fixed_noise).cpu().numpy()
 
-        scores = evaluate(generated_points, validation_points)
+        swd = sliced_wasserstein(generated_points, validation_points)
+        improved = swd < best_validation_swd
+        scores = evaluate(generated_points, validation_points) if full or improved else {'swd': swd}
         if not all(np.isfinite(value) for value in scores.values()):
             raise FloatingPointError(f'Nonfinite validation metric at step {step}')
 
         if step in snapshot_steps:
             snapshots[step] = generated_points.copy()
 
-        if scores['swd'] < best_validation_swd:
-            best_validation_swd = scores['swd']
+        if improved:
+            best_validation_swd = swd
             best_step = step
             save_checkpoint('best.pt', step)
 
         model.train()
-        return {'step': step, 'val_swd': scores['swd'], 'val_mmd2': scores['mmd2']}
+        row = {'step': step, 'val_swd': swd}
+        if 'mmd2' in scores:
+            row['val_mmd2'] = scores['mmd2']
+        return row
 
-    history.append(validate(0))
+    #Validate at step 0
+    history.append(validate(0, full=True))
 
     for step in range(1, c.steps + 1):
-        # Fresh real batch, with a reproducible new seed on each update.
-        batch_seed = int(data_rng.integers(0, 2**63))
-        real_points, _ = make_dataset(c.dataset, n=c.batch, seed=batch_seed)
+        if c.train_data == 'fresh':
+            # New samples from the true sampler, normalised with the training statistics
+            batch_seed = int(data_rng.integers(0, 2**63))
+            real_points, _ = make_dataset(c.dataset, n=c.batch, seed=batch_seed)
+            real_points = (real_points - splits.mean) / splits.scale
+        else:
+            batch = list(islice(train_loader, c.batch))
+            # Drop the incomplete rest of an epoch so every step uses c.batch points
+            if len(batch) < c.batch:
+                epoch += 1
+                train_loader = splits.train.stream(shuffle=True, seed=c.seed + epoch)
+                batch = list(islice(train_loader, c.batch))
+            real_points = np.stack([point for point, _ in batch])
 
-        # Identity transformation when normalize=False; otherwise use the SAME
-        # training-reference mean/scale as validation and test, never batch statistics.
-        real_points = (real_points - splits.mean) / splits.scale
         real = torch.as_tensor(real_points, dtype=torch.float32, device=device)
 
-        noise = torch.randn(c.batch, c.noise_dim, generator=noise_rng, device=device)
+        noise = torch.randn(len(real), c.noise_dim, generator=noise_rng, device=device)
         generated = model(noise)
 
-        loss, drift = compute_loss(generated, real, c.temperature)
+        loss, drift = compute_loss(generated, real, c.temperature, c.attraction, c.repulsion)
 
         if not torch.isfinite(loss):
             raise FloatingPointError(f'Nonfinite training loss at step {step}')
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        optimizer.step()  # No gradient clipping, matching the demo.
+        optimizer.step()
 
         row = {
             'step': step,
             'loss': loss.detach().item(),
             'drift_norm_squared': drift.square().sum(dim=1).mean().item(),
         }
-        if step % c.eval_every == 0 or step in snapshot_steps:
-            row.update(validate(step))
+        full = step % c.eval_every == 0 or step == c.steps
+        if full or step in snapshot_steps:
+            row.update(validate(step, full))
             print(
                 f'Step {step:5d}/{c.steps} | loss {row["loss"]:.6f} | '
                 f'validation SWD {row["val_swd"]:.4f}',
                 flush=True,
             )
+        if c.checkpoint_every and step % c.checkpoint_every == 0:
+            save_checkpoint(f'checkpoints/step_{step:05d}.pt', step)
         history.append(row)
 
     save_checkpoint('last.pt', c.steps)
 
-    # Use identical test points and latent noise for both checkpoints.
-    test_points = splits.test.x[:evaluation_count]
+    # Use identical test points and noise
+    test_points = np.stack([
+        point for point, _ in islice(test_loader, evaluation_count)
+    ])
     test_rng = torch.Generator(device=device).manual_seed(71234)
     test_noise = torch.randn(
         evaluation_count,
@@ -247,17 +324,21 @@ def train(c: Config, out):
         }
 
         # Additional mode diagnostics for Gaussian mixtures.
-        if c.dataset in ('bimodal', 'ring'):
+        if c.dataset in ('bimodal', 'ring', 'grid'):
             if c.dataset == 'bimodal':
                 centers = np.array([[-2.0, 0.0], [2.0, 0.0]])
                 sigma = 0.25
-            else:
+            elif c.dataset == 'ring':
                 angles = np.arange(8) * np.pi / 4
                 centers = 2 * np.column_stack([
                     np.cos(angles),
                     np.sin(angles),
                 ])
                 sigma = 0.12
+            else:
+                coords = np.arange(5) - 2.0
+                centers = np.array([[a, b] for a in coords for b in coords])
+                sigma = 0.05
 
             centers = (centers - splits.mean) / splits.scale
             scores.update(
@@ -275,7 +356,7 @@ def train(c: Config, out):
 
     best_samples, last_samples = checkpoint_samples
 
-    # Baselines are shared by both checkpoints.
+    # Baselines are shared by both checkpoints
     baseline_rng = np.random.default_rng(71234)
     gaussian_points = baseline_rng.normal(size=(evaluation_count, 2))
     gaussian_points = (gaussian_points - splits.mean) / splits.scale
@@ -313,10 +394,10 @@ def train(c: Config, out):
         test_noise=test_noise.cpu().numpy(),
     )
 
-    # Save sample evolution and training curves
+    # Save sample evolution (paper steps and the final step only) and training curves
     evolution(
         validation_points,
-        snapshots,
+        {step: points for step, points in snapshots.items() if step in PLOT_STEPS or step == c.steps},
         output_dir / 'evolution.png',
     )
     curves(history, output_dir / 'curves.png')
@@ -333,6 +414,8 @@ def main():
     defaults = asdict(Config())
     choices = {
         'dataset': NAMES,
+        'init': INITS,
+        'train_data': TRAIN_DATA,
     }
     for name, default in defaults.items():
         argument = '--' + name.replace('_', '-')

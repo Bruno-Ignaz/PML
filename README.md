@@ -78,7 +78,7 @@ Each experiment produces:
 
 ### Create a toy dataset
 
-Available datasets are `bimodal`, `ring`, `moons`, `spiral`, `checkerboard`, `heart`, `star`, and `hearts`.
+Available datasets are `bimodal`, `ring`, `moons`, `spiral`, `checkerboard`, `heart`, `star`, `hearts`, and `grid`.
 
 ```python
 from drifting.data import make_dataset

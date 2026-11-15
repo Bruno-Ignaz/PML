@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .venv/
+/outputs
 *.egg-info/
 .ipynb_checkpoints/
 /output
@@ -11,3 +12,4 @@ __pycache__/
 /results
 /results
 /results
+/output0.05norm

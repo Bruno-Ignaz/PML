@@ -8,7 +8,7 @@ import math
 
 NAMES = (
     'bimodal', 'ring', 'moons', 'spiral', 'checkerboard',
-    'heart', 'star', 'hearts',
+    'heart', 'star', 'hearts', 'grid',
 )
 
 """Creating toy datasets
@@ -77,6 +77,13 @@ def make_dataset(name: str, n=12000, seed=123):
         y = r.integers(3, size=n)
         x += np.array([[-2.2, -1.3], [2.2, -1.3], [0., 2.]])[y]
 
+    elif name == 'grid':
+        # 5x5 narrow Gaussians on a square lattice with spacing 1
+        coords = np.arange(5) - 2.
+        centers = np.array([[a, b] for a in coords for b in coords])
+        y = r.integers(len(centers), size=n)
+        x = centers[y] + r.normal(0, .05, (n, 2))
+
     #Checkerboard
     else:
         # alternating grid squares and add noise
@@ -100,7 +107,7 @@ class Split:
     y: np.ndarray
     indices: np.ndarray
     def stream(self, transform: Callable | None = None, *, shuffle=False, seed=0):
-        """One finite epoch; transformations run only at next(), never eagerly."""
+        """One finite epoch, transformations run only at next()"""
         order = np.random.default_rng(seed).permutation(len(self.x)) if shuffle else range(len(self.x))
         for i in order:
             x = self.x[i].copy()
