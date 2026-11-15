@@ -3,8 +3,8 @@
     python report_figures.py OUTPUTS_DIR TARGET_DIR
 
 Seed 42 runs are the folders without suffix (Hydra), seeds 43/44 end in -seed43/-seed44.
-SWD is always reported relative to the real-real reference (SWD between two real
-samples of the same size), so 1 means "as close as a second real sample".
+SWD is the plain test SWD on normalized data. Tables list the SWD between training
+points and the same test points as a reference for what two real samples reach.
 """
 import csv
 import json
@@ -60,12 +60,12 @@ def metrics(run, dataset, seed=42):
     return json.loads(path.read_text()) if path.exists() else None
 
 
-def ratio(m, checkpoint='best'):
-    return m[checkpoint]['test_swd'] / m['baselines']['real_real']['swd']
+def swd(m, checkpoint='best'):
+    return m[checkpoint]['test_swd']
 
 
-def seed_ratios(run, dataset, checkpoint='best'):
-    return [ratio(m, checkpoint) for s in SEEDS if (m := metrics(run, dataset, s))]
+def seed_swds(run, dataset, checkpoint='best'):
+    return [swd(m, checkpoint) for s in SEEDS if (m := metrics(run, dataset, s))]
 
 
 def samples(run, dataset, seed=42):
@@ -238,7 +238,7 @@ def fig_tau_sweep():
             s = samples(run, name)
             box = box or view(s['reference'])
             cloud(axes[row, col], s['reference'], s['best'], box)
-            corner(axes[row, col], f'{ratio(metrics(run, name)):.2f}' if ratio(metrics(run, name)) < 10 else f'{ratio(metrics(run, name)):.0f}')
+            corner(axes[row, col], fmt(swd(metrics(run, name))))
             if row == 0:
                 axes[row, col].set_title(rf'$\tau = {tau}$', pad=3)
             if col == 0:
@@ -307,7 +307,7 @@ def fig_training_length():
         curves = []
         for name in NAMES:
             _, val = history(run, name)
-            curves.append(val[:, 1] / metrics(run, name)['baselines']['real_real']['swd'])
+            curves.append(val[:, 1])
         left.plot(val[:, 0], np.median(curves, axis=0), color=color, lw=1.1, label=f'$N={b}$')
         s = samples(run, 'grid')
         config = json.loads((folder(run, 'grid') / 'config.json').read_text())['normalization']
@@ -315,7 +315,7 @@ def fig_training_length():
         steps = sorted(int(k[5:]) for k in s.files if k.startswith('step_'))
         covered = [round(25 * mode_metrics(s[f'step_{t}'], (centres - mean) / scale, 0.05 / scale)['mode_coverage']) for t in steps]
         right.plot(steps, covered, color=color, lw=1.1, marker='o', ms=2)
-    left.set(yscale='log', xlabel='training step', ylabel='validation SWD / reference\n(median over 9 datasets)')
+    left.set(yscale='log', xlabel='training step', ylabel='validation SWD\n(median over 9 datasets)')
     right.set(xlabel='training step', ylabel='grid modes covered (of 25)', ylim=(-1, 26))
     left.legend(frameon=False, handlelength=1.2)
     for ax in (left, right):
@@ -327,7 +327,7 @@ def fig_training_length():
 # ---------- tables ----------
 
 def fmt(value):
-    return f'{value:.1f}' if value >= 10 else f'{value:.2f}'
+    return f'{value:.3f}'
 
 
 def mean_std(values):
@@ -336,44 +336,45 @@ def mean_std(values):
 
 
 def table_tau():
-    lines = [r'\begin{tabular}{l' + 'c' * len(TAUS) + '}', r'\hline',
-             ' & ' + ' & '.join(rf'$\tau={t}$' for t in TAUS) + r' \\', r'\hline']
+    lines = [r'{\footnotesize\setlength{\tabcolsep}{4pt}',
+             r'\begin{tabular}{lc' + 'c' * len(TAUS) + '}', r'\hline',
+             ' & real & ' + ' & '.join(rf'$\tau={t}$' for t in TAUS) + r' \\', r'\hline']
     for name in NAMES:
-        stats = [mean_std(seed_ratios(f't{t}-norm-5000val_samples', name)) for t in TAUS]
+        stats = [mean_std(seed_swds(f't{t}-norm-5000val_samples', name)) for t in TAUS]
         best = int(np.argmin([m for m, _ in stats]))
         cells = [(r'$\mathbf{%s \pm %s}$' if i == best else r'$%s \pm %s$') % (fmt(m), fmt(s)) for i, (m, s) in enumerate(stats)]
-        lines.append(f'{name} & ' + ' & '.join(cells) + r' \\')
-    lines += [r'\hline', r'\end{tabular}']
+        reference = metrics('t0.1-norm-5000val_samples', name)['baselines']['real_real']['swd']
+        lines.append(f'{name} & {fmt(reference)} & ' + ' & '.join(cells) + r' \\')
+    lines += [r'\hline', r'\end{tabular}}']
     write('table_tau.tex', lines)
 
 
 def table_ablation():
-    per_dataset = {k: {n: np.mean(seed_ratios(ablation_run(k), n)) for n in NAMES} for k, _, _ in FIELDS}
+    per_dataset = {k: {n: np.mean(seed_swds(ablation_run(k), n)) for n in NAMES} for k, _, _ in FIELDS}
     wins = {k: 0 for k, _, _ in FIELDS}
     for n in NAMES:
         wins[min(per_dataset, key=lambda k: per_dataset[k][n])] += 1
     lines = [r'\begin{tabular}{lrcc}', r'\hline',
-             r'drifting field & FID (paper) & SWD ratio (ours) & best on \\', r'\hline']
+             r'drifting field & FID (paper) & SWD (ours) & best on \\', r'\hline']
     for key, label, fid in FIELDS:
-        medians = [np.median([ratio(metrics(ablation_run(key), n, s)) for n in NAMES]) for s in SEEDS]
+        medians = [np.median([swd(metrics(ablation_run(key), n, s)) for n in NAMES]) for s in SEEDS]
         m, sd = mean_std(medians)
-        lines.append(rf'{label} & {fid:.2f} & ${m:.2f} \pm {sd:.2f}$ & {wins[key]}/9 \\')
+        lines.append(rf'{label} & {fid:.2f} & ${fmt(m)} \pm {fmt(sd)}$ & {wins[key]}/9 \\')
     lines += [r'\hline', r'\end{tabular}']
     write('table_ablation.tex', lines)
 
 
 def table_init():
     labels = {'origin': 'between the modes', 'far': 'far from both', 'mode': 'collapsed on one'}
-    taus = ('0.05', '0.1', '0.2')
+    taus = ('0.1', '0.2')
     lines = [r'\begin{tabular}{ll' + 'c' * len(taus) + '}', r'\hline',
              r'data & start & ' + ' & '.join(rf'$\tau={t}$' for t in taus) + r' \\', r'\hline']
     for name in ('bimodal', 'ring'):
         for init in ('origin', 'far', 'mode'):
             cells = []
             for tau in taus:
-                ms = [metrics(init_run(init, tau), name, s) for s in SEEDS]
-                full = sum(m['last']['mode_coverage'] == 1 for m in ms)
-                cells.append(f'{full}/3 ({fmt(np.mean([ratio(m, "last") for m in ms]))})')
+                m, sd = mean_std(seed_swds(init_run(init, tau), name, 'last'))
+                cells.append(rf'${fmt(m)} \pm {fmt(sd)}$')
             lines.append(f'{name if init == "origin" else ""} & {labels[init]} & ' + ' & '.join(cells) + r' \\')
         lines.append(r'\hline')
     lines.append(r'\end{tabular}')
@@ -388,7 +389,7 @@ def table_batch():
     lines = [r'\begin{tabular}{l' + 'c' * len(BATCHES) + '}', r'\hline',
              ' & ' + ' & '.join(f'$B={b}$' for b in BATCHES) + r' \\', r'\hline']
     for tau in TAUS:
-        medians = [np.median([ratio(metrics(f't{tau}-norm-b{b}-steps8000-5000val_samples', n)) for n in NAMES]) for b in BATCHES]
+        medians = [np.median([swd(metrics(f't{tau}-norm-b{b}-steps8000-5000val_samples', n)) for n in NAMES]) for b in BATCHES]
         lines.append(rf'$\tau={tau}$ & ' + ' & '.join(fmt(m) for m in medians) + r' \\')
     lines.append(r'\hline')
     coverage = [metrics(f't0.1-norm-b{b}-steps8000-5000val_samples', 'grid')['best']['mode_coverage'] for b in BATCHES]
